@@ -24,20 +24,22 @@ import {
 export default function AdminDashboard() {
   const [selectedDivision, setSelectedDivision] = useState('SE1');
   const [selectedDay, setSelectedDay] = useState('All');
-  const [isGenerating, setIsGenerating] = useState(false);
-  const [generationStep, setGenerationStep] = useState(0);
   const [showGenModal, setShowGenModal] = useState(false);
   const [timetableData, setTimetableData] = useState({});
   const [lastGeneratedTime, setLastGeneratedTime] = useState('Today at 09:30 AM');
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  const steps = [
-    'Analyzing department faculty workload & course credits...',
-    'Validating room availability (CR-201, CR-202, CR-203, CR-304, CR-305, Labs)...',
-    'Running genetic conflict prevention algorithm (Zero Teacher Clashes)...',
-    'Finalizing optimized timetable matrices for SE1, SE2, SE3, TE1, and TE2...'
-  ];
+  /* Real generation state, driven entirely by the backend response */
+  const [genStatus, setGenStatus] = useState('idle'); // idle | generating | success | error
+  const [genResult, setGenResult] = useState(null);
+  const [genError, setGenError] = useState(null);
+
+  const isGenerating = genStatus === 'generating';
+
+  /* Manual slot edit state (PUT /timetable/slot/:id) */
+  const [isSavingSlot, setIsSavingSlot] = useState(false);
+  const [slotError, setSlotError] = useState(null);
 
   const fetchTimetable = async () => {
     setIsLoading(true);
@@ -63,31 +65,75 @@ export default function AdminDashboard() {
     fetchTimetable();
   }, []);
 
-  const handleGenerateTimetable = () => {
+  const handleGenerateTimetable = async () => {
     setShowGenModal(true);
-    setIsGenerating(true);
-    setGenerationStep(0);
+    setGenStatus('generating');
+    setGenResult(null);
+    setGenError(null);
 
-    const interval = setInterval(() => {
-      setGenerationStep((prev) => {
-        if (prev < steps.length - 1) {
-          return prev + 1;
-        } else {
-          clearInterval(interval);
-          setIsGenerating(false);
+    try {
+      /* api.post attaches the JWT as "Authorization: Bearer <token>" (see services/api.js) */
+      const response = await api.post('/timetable/generate', {});
 
-          setLastGeneratedTime(
-            new Date().toLocaleTimeString([], {
-              hour: '2-digit',
-              minute: '2-digit'
-            })
-          );
+      setGenResult(response);
+      setGenStatus('success');
 
-          return prev;
-        }
-      });
-    }, 900);
+      /* Pull the freshly generated timetable back down (GET /timetable) */
+      await fetchTimetable();
+    } catch (err) {
+      setGenError(err.message || 'Failed to generate timetable');
+      setGenStatus('error');
+      console.error('Timetable generation error:', err);
+    }
   };
+
+  const closeGenModal = () => {
+    setShowGenModal(false);
+    setGenStatus('idle');
+    setGenResult(null);
+    setGenError(null);
+  };
+
+  /* Persist a manual edit of an existing slot. api.put sends the JWT as
+     "Authorization: Bearer <token>", same as every other request.
+     Note: GET /timetable does not currently return slot _id / *Ref values, so
+     this cannot be triggered from the timetable grid until that is exposed. */
+  const handleSaveSlot = async (slotId, changes) => {
+    setIsSavingSlot(true);
+    setSlotError(null);
+
+    try {
+      await api.put(`/timetable/slot/${slotId}`, changes);
+
+      /* Pull the updated timetable back down so the grid reflects the edit */
+      await fetchTimetable();
+
+      return { success: true };
+    } catch (err) {
+      /* 409 carries the clash message from the backend (teacher, classroom
+         or division clash); api.js puts it on err.message */
+      setSlotError({
+        message: err.message || 'Failed to update timetable slot',
+        isClash: err.status === 409
+      });
+      console.error('Timetable slot update error:', err);
+
+      return { success: false, error: err };
+    } finally {
+      setIsSavingSlot(false);
+    }
+  };
+
+  const genStats = genResult
+    ? [
+        { label: 'Divisions scheduled', value: genResult.divisions?.length ?? 0 },
+        { label: 'Timetable slots created', value: genResult.slotsCreated ?? 0 },
+        { label: 'Sessions left unplaced', value: genResult.unplacedCount ?? 0 }
+      ]
+    : [];
+
+  const genWarnings = genResult?.warnings || [];
+  const genUnplaced = genResult?.unplaced || [];
 
   return (
     <div className="min-h-screen bg-white text-slate-900 flex flex-col">
@@ -134,10 +180,21 @@ export default function AdminDashboard() {
 
             <button
               onClick={handleGenerateTimetable}
-              className="px-5 py-3 rounded-xl text-xs sm:text-sm font-bold text-white bg-blue-600 hover:bg-blue-700 shadow-md shadow-blue-600/20 transition-all flex items-center justify-center gap-2 cursor-pointer"
+              disabled={isGenerating}
+              className={`px-5 py-3 rounded-xl text-xs sm:text-sm font-bold text-white bg-blue-600 hover:bg-blue-700 shadow-md shadow-blue-600/20 transition-all flex items-center justify-center gap-2 ${
+                isGenerating
+                  ? 'opacity-60 cursor-not-allowed'
+                  : 'cursor-pointer'
+              }`}
             >
-              <Sparkles className="w-4 h-4" />
-              <span>Generate Timetable</span>
+              {isGenerating ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Sparkles className="w-4 h-4" />
+              )}
+              <span>
+                {isGenerating ? 'Generating...' : 'Generate Timetable'}
+              </span>
             </button>
 
           </div>
@@ -371,6 +428,8 @@ export default function AdminDashboard() {
 
                 {isGenerating ? (
                   <RefreshCw className="w-7 h-7 animate-spin" />
+                ) : genStatus === 'error' ? (
+                  <AlertCircle className="w-7 h-7 text-red-500" />
                 ) : (
                   <CheckCircle2 className="w-7 h-7 text-emerald-500" />
                 )}
@@ -381,6 +440,8 @@ export default function AdminDashboard() {
 
                 {isGenerating
                   ? 'Generating Automatic Timetable'
+                  : genStatus === 'error'
+                  ? 'Timetable Generation Failed'
                   : 'Timetable Generated Successfully!'}
 
               </h3>
@@ -389,62 +450,162 @@ export default function AdminDashboard() {
 
                 {isGenerating
                   ? 'Constraint satisfaction engine is organizing conflict-free schedules.'
-                  : 'Master schedules for SE1, SE2, SE3, TE1, and TE2 are ready with zero teacher clashes.'}
+                  : genStatus === 'error'
+                  ? 'The server could not generate the timetable.'
+                  : genResult?.message}
 
               </p>
 
             </div>
 
 
-            {/* Progress Steps */}
+            {/* Progress / Real Backend Result / Real Backend Error */}
 
-            <div className="space-y-3 bg-slate-50 p-4 rounded-xl border border-slate-200 text-xs">
+            {isGenerating ? (
 
-              {steps.map((step, idx) => {
+              <div className="space-y-3 bg-slate-50 p-4 rounded-xl border border-slate-200 text-xs">
 
-                const isDone = idx < generationStep || !isGenerating;
-                const isCurrent =
-                  idx === generationStep && isGenerating;
+                <div className="h-1.5 w-full rounded-full bg-slate-200 overflow-hidden">
+                  <div className="h-full w-1/3 bg-blue-600 rounded-full animate-pulse"></div>
+                </div>
 
-                return (
+                <p className="text-slate-600 font-medium">
+                  Running the constraint solver on the server (POST
+                  /api/timetable/generate)...
+                </p>
+
+                <div className="space-y-2 text-slate-400">
+
+                  <div className="flex items-start gap-2.5">
+                    <RefreshCw className="w-4 h-4 text-blue-600 animate-spin shrink-0 mt-0.5" />
+                    <span className="text-blue-700 font-semibold">
+                      Placing sessions with zero teacher & classroom clashes...
+                    </span>
+                  </div>
+
+                  <div className="flex items-start gap-2.5">
+                    <div className="w-4 h-4 rounded-full border border-slate-300 shrink-0 mt-0.5" />
+                    <span>
+                      Teacher cannot be booked for two divisions at the same
+                      day and time.
+                    </span>
+                  </div>
+
+                  <div className="flex items-start gap-2.5">
+                    <div className="w-4 h-4 rounded-full border border-slate-300 shrink-0 mt-0.5" />
+                    <span>
+                      A classroom cannot host two divisions at the same day and
+                      time.
+                    </span>
+                  </div>
+
+                </div>
+
+              </div>
+
+            ) : genStatus === 'error' ? (
+
+              <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-xs flex items-start gap-2.5">
+
+                <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+
+                <div className="space-y-1">
+
+                  <span className="font-bold text-red-800 block">
+                    Backend rejected the request
+                  </span>
+
+                  <p className="text-red-700 leading-relaxed break-words">
+                    {genError}
+                  </p>
+
+                </div>
+
+              </div>
+
+            ) : (
+
+              <div className="space-y-3 bg-slate-50 p-4 rounded-xl border border-slate-200 text-xs">
+
+                {genStats.map((stat) => (
+
+                  <div
+                    key={stat.label}
+                    className="flex items-start gap-2.5"
+                  >
+
+                    <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0 mt-0.5" />
+
+                    <span className="text-slate-700 font-medium">
+                      {stat.label}:{' '}
+                      <strong className="text-slate-900">{stat.value}</strong>
+                    </span>
+
+                  </div>
+
+                ))}
+
+                {genWarnings.map((warning, idx) => (
 
                   <div
                     key={idx}
                     className="flex items-start gap-2.5"
                   >
 
-                    {isDone ? (
+                    <AlertCircle className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
 
-                      <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0 mt-0.5" />
-
-                    ) : isCurrent ? (
-
-                      <RefreshCw className="w-4 h-4 text-blue-600 animate-spin shrink-0 mt-0.5" />
-
-                    ) : (
-
-                      <div className="w-4 h-4 rounded-full border border-slate-300 shrink-0 mt-0.5" />
-
-                    )}
-
-                    <span
-                      className={
-                        isDone
-                          ? 'text-slate-700 font-medium'
-                          : isCurrent
-                          ? 'text-blue-700 font-semibold'
-                          : 'text-slate-400'
-                      }
-                    >
-                      {step}
+                    <span className="text-amber-700 leading-relaxed">
+                      {warning}
                     </span>
 
                   </div>
 
-                );
-              })}
+                ))}
 
-            </div>
+                {genUnplaced.length > 0 && (
+
+                  <div className="pt-1 space-y-1.5">
+
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
+                      Unplaced sessions
+                    </span>
+
+                    <div className="max-h-32 overflow-y-auto space-y-1.5 pr-1">
+
+                      {genUnplaced.map((item, idx) => (
+
+                        <div
+                          key={idx}
+                          className="text-[11px] text-slate-600 bg-white border border-slate-200 rounded-lg px-2.5 py-1.5"
+                        >
+                          <span className="font-semibold text-slate-800">
+                            {item.subject}
+                          </span>
+                          {item.teacher && item.teacher !== '-' ? ` - ${item.teacher}` : ''}
+                          <span className="block text-slate-500">
+                            {item.reason}
+                          </span>
+                        </div>
+
+                      ))}
+
+                    </div>
+
+                  </div>
+
+                )}
+
+                {genResult?.generationBatch && (
+
+                  <p className="text-[10px] text-slate-400 font-mono truncate">
+                    Batch: {genResult.generationBatch}
+                  </p>
+
+                )}
+
+              </div>
+
+            )}
 
 
             {/* Close */}
@@ -452,7 +613,7 @@ export default function AdminDashboard() {
             {!isGenerating && (
 
               <button
-                onClick={() => setShowGenModal(false)}
+                onClick={closeGenModal}
                 className="w-full py-3 rounded-xl font-bold text-sm bg-blue-600 hover:bg-blue-700 text-white transition-all shadow-md shadow-blue-600/20 cursor-pointer"
               >
                 Close & View Updated Timetables
