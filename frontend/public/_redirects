@@ -1,0 +1,6 @@
+# SPA fallback for React Router.
+# Without this, a hard refresh on /login, /admin, /teacher or /student returns 404
+# because those paths exist only client-side. status 200 = rewrite, not a redirect,
+# and Netlify only applies it when no static file matches, so hashed assets in
+# /assets are still served normally.
+/*  /index.html  200

@@ -16,7 +16,7 @@ export const AuthProvider = ({ children }) => {
     return null;
   });
 
-  const login = async (role, username, email, password) => {
+  const login = async (email, password) => {
     try {
       const response = await api.post('/auth/login', { email, password });
       
@@ -24,11 +24,20 @@ export const AuthProvider = ({ children }) => {
         localStorage.setItem('token', response.token);
       }
 
+      const authenticatedUser = response.user;
+
+      if (!authenticatedUser) {
+        throw new Error('Login response did not include user information');
+      }
+
       const newUser = {
-        role: role.toLowerCase(),
-        name: username || response.user?.name || response.name,
-        email: email || response.user?.email || response.email,
-        department: response.user?.department || response.department || 'Computer Engineering'
+        id: authenticatedUser.id,
+        role: authenticatedUser.role,
+        name: authenticatedUser.name,
+        email: authenticatedUser.email,
+        department: authenticatedUser.department,
+        teacher: authenticatedUser.teacher || null,
+        division: authenticatedUser.division || null
       };
 
       setUser(newUser);

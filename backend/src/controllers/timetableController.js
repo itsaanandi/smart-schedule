@@ -4,7 +4,7 @@ const Division = require('../models/Division');
 const Subject = require('../models/Subject');
 const TimetableSlot = require('../models/TimetableSlot');
 const { generateTimetable } = require('../utils/timetableGenerator');
-const { DAYS, TIME_SLOTS } = require('../config/constants');
+const { DAYS, TIME_SLOT_STRINGS } = require('../config/constants');
 
 // @desc    Trigger automatic timetable generation for all (or selected) divisions
 // @route   POST /api/timetable/generate
@@ -76,13 +76,34 @@ const getDivisionTimetable = asyncHandler(async (req, res) => {
     throw new Error('Division not found');
   }
 
+  // Same role scoping as GET /api/timetable, so this route cannot be used to bypass it
+  if (req.user.role === 'student' && String(division._id) !== String(req.user.division)) {
+    res.status(403);
+    throw new Error('You are not allowed to view another division timetable');
+  }
+
+  if (req.user.role === 'teacher') {
+    if (!req.user.teacher) {
+      res.status(403);
+      throw new Error('This teacher account is not linked to a teacher profile yet');
+    }
+    const teachesDivision = await Subject.findOne({
+      division: division._id,
+      teacher: req.user.teacher
+    });
+    if (!teachesDivision) {
+      res.status(403);
+      throw new Error('You are not assigned to teach this division');
+    }
+  }
+
   const slots = await TimetableSlot.find({ division: divisionId });
 
   const grouped = {};
   DAYS.forEach((day) => {
     const daySlots = slots
       .filter((s) => s.day === day)
-      .sort((a, b) => TIME_SLOTS.indexOf(a.time) - TIME_SLOTS.indexOf(b.time))
+      .sort((a, b) => TIME_SLOT_STRINGS.indexOf(a.time) - TIME_SLOT_STRINGS.indexOf(b.time))
       .map((s) => ({
         time: s.time,
         subject: s.subject,
@@ -100,12 +121,41 @@ const getDivisionTimetable = asyncHandler(async (req, res) => {
   });
 });
 
-// @desc    Get timetables for every division at once, shaped like DUMMY_TIMETABLE
+// @desc    Get timetables scoped to the authenticated user's role:
+//            admin   -> every division
+//            teacher -> only the sessions assigned to that teacher
+//            student -> only their own division
 // @route   GET /api/timetable
 // @access  Private
 const getAllTimetables = asyncHandler(async (req, res) => {
-  const divisions = await Division.find().sort({ year: 1, code: 1 });
-  const slots = await TimetableSlot.find();
+  const { role } = req.user;
+
+  let slotFilter = {};
+  let divisionFilter = {};
+
+  if (role === 'teacher') {
+    if (!req.user.teacher) {
+      res.status(403);
+      throw new Error('This teacher account is not linked to a teacher profile yet');
+    }
+    slotFilter = { teacherRef: req.user.teacher };
+  } else if (role === 'student') {
+    if (!req.user.division) {
+      res.status(403);
+      throw new Error('This student account is not linked to a division yet');
+    }
+    divisionFilter = { _id: req.user.division };
+    slotFilter = { division: req.user.division };
+  }
+
+  const slots = await TimetableSlot.find(slotFilter);
+
+  // A teacher only ever sees the divisions they are actually assigned to teach
+  if (role === 'teacher') {
+    divisionFilter = { _id: { $in: [...new Set(slots.map((s) => s.division))] } };
+  }
+
+  const divisions = await Division.find(divisionFilter).sort({ year: 1, code: 1 });
 
   const timetable = {};
   divisions.forEach((division) => {
@@ -114,7 +164,7 @@ const getAllTimetables = asyncHandler(async (req, res) => {
     DAYS.forEach((day) => {
       grouped[day] = divisionSlots
         .filter((s) => s.day === day)
-        .sort((a, b) => TIME_SLOTS.indexOf(a.time) - TIME_SLOTS.indexOf(b.time))
+        .sort((a, b) => TIME_SLOT_STRINGS.indexOf(a.time) - TIME_SLOT_STRINGS.indexOf(b.time))
         .map((s) => ({
           time: s.time,
           subject: s.subject,
@@ -177,6 +227,89 @@ const upsertSlot = asyncHandler(async (req, res) => {
   res.status(200).json({ success: true, slot });
 });
 
+// @desc    Manually move/edit an existing timetable slot (e.g. resolve a clash by hand)
+// @route   PUT /api/timetable/slot/:id
+// @body    { subject?, teacher?, classroom?, day?, time?, type?, subjectRef?, teacherRef?, classroomRef? }
+// @access  Private/Admin
+const updateSlot = asyncHandler(async (req, res) => {
+  const { subject, teacher, classroom, day, time, type, subjectRef, teacherRef, classroomRef } =
+    req.body;
+
+  const slot = await TimetableSlot.findById(req.params.id).populate('division', 'code');
+
+  if (!slot) {
+    res.status(404);
+    throw new Error('Timetable slot not found');
+  }
+
+  // Only the provided fields change; everything else keeps its current value
+  const updates = {
+    subject: subject ?? slot.subject,
+    teacher: teacher ?? slot.teacher,
+    classroom: classroom ?? slot.classroom,
+    day: day ?? slot.day,
+    time: time ?? slot.time,
+    type: type ?? slot.type,
+    subjectRef: subjectRef ?? slot.subjectRef,
+    teacherRef: teacherRef ?? slot.teacherRef,
+    classroomRef: classroomRef ?? slot.classroomRef
+  };
+
+  const divisionId = slot.division._id;
+
+  // Enforce the same hard constraints as the generator. The slot being edited
+  // is excluded from every check so it never clashes with itself.
+  if (updates.teacherRef) {
+    const clash = await TimetableSlot.findOne({
+      _id: { $ne: slot._id },
+      day: updates.day,
+      time: updates.time,
+      teacherRef: updates.teacherRef,
+      division: { $ne: divisionId }
+    });
+    if (clash) {
+      res.status(409);
+      throw new Error(
+        `Teacher clash: already teaching another division at ${updates.day} ${updates.time}`
+      );
+    }
+  }
+
+  if (updates.classroomRef) {
+    const clash = await TimetableSlot.findOne({
+      _id: { $ne: slot._id },
+      day: updates.day,
+      time: updates.time,
+      classroomRef: updates.classroomRef,
+      division: { $ne: divisionId }
+    });
+    if (clash) {
+      res.status(409);
+      throw new Error(
+        `Classroom clash: room already in use by another division at ${updates.day} ${updates.time}`
+      );
+    }
+  }
+
+  const ownClash = await TimetableSlot.findOne({
+    _id: { $ne: slot._id },
+    division: divisionId,
+    day: updates.day,
+    time: updates.time
+  });
+  if (ownClash) {
+    res.status(409);
+    throw new Error(
+      `Division clash: ${slot.division.code} already has a session at ${updates.day} ${updates.time}`
+    );
+  }
+
+  slot.set(updates);
+  await slot.save({ runValidators: true });
+
+  res.status(200).json({ success: true, slot });
+});
+
 // @desc    Delete all generated slots for a division (reset)
 // @route   DELETE /api/timetable/division/:divisionId
 // @access  Private/Admin
@@ -190,5 +323,6 @@ module.exports = {
   getDivisionTimetable,
   getAllTimetables,
   upsertSlot,
+  updateSlot,
   clearDivisionTimetable
 };

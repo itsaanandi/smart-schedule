@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { api } from '../services/api';
 import Navbar from '../components/Navbar';
 import Timetable from '../components/Timetable';
+import { resolveUserDivisionCode } from '../utils/userDivision';
 import {
   DEPARTMENT_INFO,
   DIVISIONS_INFO,
@@ -18,20 +19,33 @@ import {
 
 export default function StudentDashboard() {
   const { user } = useAuth();
-  const [selectedDivision, setSelectedDivision] = useState('SE1');
+  const [selectedDivision, setSelectedDivision] = useState(null);
   const [selectedDay, setSelectedDay] = useState('All');
   const [timetableData, setTimetableData] = useState({});
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  const activeDivInfo = DIVISIONS_INFO[selectedDivision];
+  const activeDivInfo =
+    DIVISIONS_INFO[selectedDivision] || DIVISIONS_INFO[DEPARTMENT_INFO.divisions[0]];
 
   const fetchTimetable = async () => {
     setIsLoading(true);
     setError(null);
     try {
-      const response = await api.get('/timetable');
-      setTimetableData(response.timetable);
+      const [timetableResponse, divisionsResponse] = await Promise.all([
+        api.get('/timetable'),
+        // Best effort: a failure here must not block the timetable itself
+        api.get('/divisions').catch(() => null)
+      ]);
+
+      const timetable = timetableResponse.timetable || {};
+      const divisions = divisionsResponse?.divisions || null;
+
+      setTimetableData(timetable);
+
+      // Land on this student's own division, never on a hardcoded one.
+      // "prev ||" keeps a division the student picked by hand.
+      setSelectedDivision((prev) => prev || resolveUserDivisionCode(user, divisions) || Object.keys(timetable)[0] || null);
     } catch (err) {
       setError(err.message || 'Failed to load timetable');
       console.error('Timetable fetch error:', err);
@@ -201,7 +215,7 @@ export default function StudentDashboard() {
           ) : (
             <Timetable
               timetableData={timetableData}
-              selectedDivision={selectedDivision}
+              selectedDivision={selectedDivision || undefined}
               selectedDay={selectedDay}
             />
           )}
